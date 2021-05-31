@@ -9,7 +9,7 @@
 
 // 当前模块的绝对路径
 v8::Persistent<v8::String> currentModuleId;
-// 模块缓存
+// 模块缓存 key为模块的文件全路径，value 为 module对象
 v8::Persistent<v8::Object> cache;
 
 std::string getAbsolutePath(const std::string& path,
@@ -77,16 +77,15 @@ inline bool has_suffix(const std::string &str, const std::string &suffix){
  * @param info
  */
 void require(const v8::FunctionCallbackInfo<v8::Value> &info) {
+
+    // 参数校验。如果没有参数传递。返回null
+    if (!info.Length() || !info[0]->IsString()) {
+        info.GetReturnValue().SetNull();
+        return;
+    }
     v8::Isolate* isolate = info.GetIsolate();
     v8::Local<v8::Context> context = isolate->GetCurrentContext();
-    if (!info.Length()) {
-        info.GetReturnValue().Set(isolate->ThrowException(v8::String::NewFromUtf8Literal(isolate, "需要一个参数")));
-        return;
-    }
-    if (!info[0]->IsString()) {
-        info.GetReturnValue().Set(isolate->ThrowException(v8::String::NewFromUtf8Literal(isolate, "require的表示为字符串")));
-        return;
-    }
+    v8::HandleScope handleScope(isolate);
 
     v8::Local<v8::Object> moduleCache = v8::Local<v8::Object>::New(isolate, cache);
     v8::Local<v8::String> moduleId = v8::Local<v8::String>::New(isolate, currentModuleId);
@@ -96,10 +95,12 @@ void require(const v8::FunctionCallbackInfo<v8::Value> &info) {
     }
 
     std::string  moduleDir(*v8::String::Utf8Value(isolate, moduleId));
+    std::string  parentModuleId = moduleDir;
     if (moduleDir.find(std::string("."))  != -1) {
         int index = moduleDir.find_last_of("/");
         moduleDir = moduleDir.substr(0, index);
     }
+    // 父模块id
     std::string moduleAbsolutePath = getAbsolutePath(modulePath, moduleDir);
 
     // 查找缓存
@@ -123,6 +124,26 @@ void require(const v8::FunctionCallbackInfo<v8::Value> &info) {
     if (!module.IsEmpty() && !module->IsUndefined()) {
         v8::Local<v8::Object> exports = module.As<v8::Object>()->Get(context, v8::String::NewFromUtf8Literal(isolate, "exports")).ToLocalChecked().As<v8::Object>();
         if (!exports.IsEmpty() && !exports->IsUndefined()) {
+            v8::Local<v8::Object> parentModule = moduleCache->Get(context, v8::String::NewFromUtf8(isolate, parentModuleId.c_str()).ToLocalChecked()).ToLocalChecked().As<v8::Object>();
+            // 获取父模块。把当前模块设置到夫模块的依赖项中。
+            if (!parentModule.IsEmpty() && !parentModule->IsUndefined()) {
+                // 获取模块的依赖数组
+                v8::Local<v8::Array> dependencies = parentModule->Get(context, v8::String::NewFromUtf8Literal(isolate, "dependencies")).ToLocalChecked().As<v8::Array>();
+                int length = dependencies->Length();
+                bool isFind = false;
+                // 防止重复添加
+                for (int index = 0; index < length; ++index) {
+                    v8::Local<v8::String> depend = dependencies->Get(context, index).ToLocalChecked().As<v8::String>();
+                    if (depend->StrictEquals(v8::String::NewFromUtf8(isolate, moduleAbsolutePath.c_str()).ToLocalChecked())){
+                        isFind = true;
+                        break;
+                    }
+                }
+                if (!isFind) {
+                    // 把当前模块添加到父模块中
+                    dependencies->Set(context, length, v8::String::NewFromUtf8(isolate, moduleAbsolutePath.c_str()).ToLocalChecked()).FromJust();
+                }
+            }
             info.GetReturnValue().Set(exports);
             return;
         }
@@ -135,7 +156,38 @@ void require(const v8::FunctionCallbackInfo<v8::Value> &info) {
  * @param info
  */
 void async(const v8::FunctionCallbackInfo<v8::Value> &info) {
+    if (info.Length() != 2 || !info[0]->IsString() && !info[1]->IsFunction()) {
+        info.GetReturnValue().SetNull();
+        return;
+    }
+    v8::Isolate* isolate = info.GetIsolate();
+    v8::HandleScope handleScope(isolate);
+    v8::Local<v8::Context> context = isolate->GetCurrentContext();
 
+    // 把参数设置到对象params。
+    v8::Local<v8::Object> params = v8::Object::New(isolate);
+    params->Set(context, v8::String::NewFromUtf8Literal(isolate, "modulePath"), info[0]).FromJust();
+    params->Set(context, v8::String::NewFromUtf8Literal(isolate, "callBack"), info[1]).FromJust();
+
+    // 存放再微任务队列中。
+    isolate->EnqueueMicrotask(v8::Function::New(context, [](const v8::FunctionCallbackInfo<v8::Value> &info) -> void {
+        v8::Isolate* isolate = info.GetIsolate();
+        v8::HandleScope handleScope(isolate);
+        v8::Local<v8::Context> context = isolate->GetCurrentContext();
+        v8::Local<v8::Object> params = info.Data().As<v8::Object>();
+        v8::Local<v8::Function> requireFun = v8::Function::New(context, require).ToLocalChecked();
+        v8::Local<v8::Value> args[] = { params->Get(context, v8::String::NewFromUtf8Literal(isolate, "modulePath")).ToLocalChecked() };
+        v8::Local<v8::Value> result = requireFun->Call(context, context->Global(), 1, args).ToLocalChecked();
+        v8::Local<v8::Function> callBack = params->Get(context, v8::String::NewFromUtf8Literal(isolate, "callBack")).ToLocalChecked();
+
+        if (result.IsEmpty() || result->IsUndefined()) {
+            v8::Local<v8::Value> argv[] = { v8::Null(isolate) };
+            callBack->Call(context, context->Global(), 1, argv);
+        } else {
+            v8::Local<v8::Value> argv[] = { result };
+            callBack->Call(context, context->Global(), 1, argv);
+        }
+    }, params).ToLocalChecked());
 }
 
 /**
@@ -145,12 +197,16 @@ void async(const v8::FunctionCallbackInfo<v8::Value> &info) {
 void define(const v8::FunctionCallbackInfo<v8::Value> &info) {
     v8::Isolate* isolate = info.GetIsolate();
     v8::Local<v8::Context> context = isolate->GetCurrentContext();
-    if (!info.Length()) {
-        info.GetReturnValue().Set(isolate->ThrowException(v8::String::NewFromUtf8Literal(isolate, "只是需要一个参数")));
+    // 参数校验，define的参数必须为一个函数或者为一个有效的javaScript值。
+    if (!info.Length() || info[0]->IsUndefined() || info[0]->IsNull()) {
+        info.GetReturnValue().Set(isolate->ThrowException(v8::String::NewFromUtf8Literal(isolate, "需要一个参数")));
         return;
     }
+
+    // 把正在执行的持久化moduleId 和模块缓存对象本地化。
     v8::Local<v8::Object> moduleCache = v8::Local<v8::Object>::New(isolate, cache);
     v8::Local<v8::String> moduleId = v8::Local<v8::String>::New(isolate, currentModuleId);
+
     // 构建 module对象， module.exports对象
     v8::Local<v8::Object> module = v8::Object::New(isolate);
     module->Set(context, v8::String::NewFromUtf8Literal(isolate, "uri"), moduleId).FromJust();
@@ -158,13 +214,17 @@ void define(const v8::FunctionCallbackInfo<v8::Value> &info) {
     moduleCache->Set(context, moduleId, module).FromJust();
     if (info[0]->IsFunction()) {
         v8::Local<v8::Object> exports = v8::Object::New(isolate);
+        // 设置module对象的 exports和 dependencies属性。exports为对象。 dependencies为数组。
         module->Set(context, v8::String::NewFromUtf8Literal(isolate, "exports"), exports).FromJust();
+        module->Set(context, v8::String::NewFromUtf8Literal(isolate, "dependencies"), v8::Array::New(isolate)).FromJust();
+
         v8::Local<v8::Function> moduleCallBack = info[0].As<v8::Function>();
         // 构建require 函数
         v8::Local<v8::Function> requireFun =  v8::Function::New(context, require).ToLocalChecked();
         // 为require 函数添加 async 函数属性
         requireFun->Set(context, v8::String::NewFromUtf8Literal(isolate, "async"), v8::Function::New(context, async).ToLocalChecked()).FromJust();
         v8::Local<v8::Value> argv[] = { requireFun, exports, module};
+        // 执行define 的参数回调
         moduleCallBack->Call(context, context->Global(), 3, argv).ToLocalChecked();
     } else {
         module->Set(context, v8::String::NewFromUtf8Literal(isolate, "exports"), info[0]).FromJust();
@@ -174,7 +234,7 @@ void define(const v8::FunctionCallbackInfo<v8::Value> &info) {
 
 
 /**
- *  启动函数，参数0 为程序的名称 参数二为主模块
+ *  启动函数，参数0 为程序的名称 参数二为主模块的路径。可以是相对路径，绝对路径
  * @param args
  * @param argv
  * @return
@@ -230,6 +290,8 @@ int main(int args, char** argv) {
         v8::Local<v8::Value> args[] = { v8::String::NewFromUtf8(isolate, argv[1]).ToLocalChecked() };
         // 加载主模块
         requireFun->Call(context, context->Global(), 1, args).ToLocalChecked();
+        //情况微任务队列。
+        isolate->PerformMicrotaskCheckpoint();
     }
     isolate->Dispose();
     v8::V8::Dispose();
