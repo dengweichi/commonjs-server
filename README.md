@@ -1,2 +1,1 @@
-# commonjs_server
-v8是实现commonjs规范的模块加载
+# v8-learn
