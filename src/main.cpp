@@ -12,14 +12,20 @@ v8::Persistent<v8::String> currentModuleId;
 // 模块缓存 key为模块的文件全路径，value 为 module对象
 v8::Persistent<v8::Object> cache;
 
+/**
+ * 技术路径path相对于 dir的绝对路径
+ * @param path 文件路径
+ * @param dir_name 目录
+ * @return
+ */
 std::string getAbsolutePath(const std::string& path,
-                            const std::string& dir_name) {
+                            const std::string& dir) {
     std::string absolute_path;
     // 判断是否为绝对路径。在linux 上下。文件以 / 开头
     if ( path[0] == '/') {
         absolute_path = path;
     } else {
-        absolute_path = dir_name + '/' + path;
+        absolute_path = dir + '/' + path;
     }
     std::replace(absolute_path.begin(), absolute_path.end(), '\\', '/');
     std::vector<std::string> segments;
@@ -50,11 +56,11 @@ v8::Local<v8::String>  readFile (std::string& path) {
     std::ifstream in(path.c_str());
     // 如果打开文件失败
     if (!in.is_open()) {
-        isolate->ThrowException(v8::String::NewFromUtf8Literal(isolate, "无法打开文件"));
         return v8::Local<v8::String>();
     }
     std::string source;
     char buffer[256];
+    // 如果没有读取到文件结束符位置。
     while(!in.eof()){
         in.getline(buffer,256);
         source.append(buffer);
@@ -73,7 +79,7 @@ inline bool has_suffix(const std::string &str, const std::string &suffix){
            str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 /**
- * require 函数的实现
+ * require 函数的实现,用于模块的获取。
  * @param info
  */
 void require(const v8::FunctionCallbackInfo<v8::Value> &info) {
@@ -96,6 +102,7 @@ void require(const v8::FunctionCallbackInfo<v8::Value> &info) {
 
     std::string  moduleDir(*v8::String::Utf8Value(isolate, moduleId));
     std::string  parentModuleId = moduleDir;
+    // 获取夫模块的目录
     if (moduleDir.find(std::string("."))  != -1) {
         int index = moduleDir.find_last_of("/");
         moduleDir = moduleDir.substr(0, index);
@@ -113,6 +120,12 @@ void require(const v8::FunctionCallbackInfo<v8::Value> &info) {
     }
     // 读取原文件
     v8::Local<v8::String> source = readFile(moduleAbsolutePath);
+
+    if (source.IsEmpty()) {
+        info.GetReturnValue().SetNull();
+        return;
+    }
+
     // 构建脚本
     v8::Local<v8::Script> script = v8::Script::Compile(context, source).ToLocalChecked();
 
@@ -120,6 +133,7 @@ void require(const v8::FunctionCallbackInfo<v8::Value> &info) {
     currentModuleId.Reset(isolate, v8::String::NewFromUtf8(isolate, moduleAbsolutePath.c_str()).ToLocalChecked());
     // 执行模块
     script->Run(context).ToLocalChecked();
+    // 从缓存模块中获取
     module = moduleCache->Get(context, v8::String::NewFromUtf8(isolate, moduleAbsolutePath.c_str()).ToLocalChecked()).ToLocalChecked();
     if (!module.IsEmpty() && !module->IsUndefined()) {
         v8::Local<v8::Object> exports = module.As<v8::Object>()->Get(context, v8::String::NewFromUtf8Literal(isolate, "exports")).ToLocalChecked().As<v8::Object>();
@@ -153,9 +167,17 @@ void require(const v8::FunctionCallbackInfo<v8::Value> &info) {
 
 /**
  * 异步获取模块
+ * 在commonjs 文件中使用
+ * define(function(require, export, module) {
+ *     require.async('path', (module1) => {
+ *     });
+ *     const module2 = require('path');
+ * })
  * @param info
  */
 void async(const v8::FunctionCallbackInfo<v8::Value> &info) {
+
+    // 参数校验。async必须两个参数，第一个为字符串路径。第二个为回调函数。
     if (info.Length() != 2 || !info[0]->IsString() && !info[1]->IsFunction()) {
         info.GetReturnValue().SetNull();
         return;
@@ -164,12 +186,12 @@ void async(const v8::FunctionCallbackInfo<v8::Value> &info) {
     v8::HandleScope handleScope(isolate);
     v8::Local<v8::Context> context = isolate->GetCurrentContext();
 
-    // 把参数设置到对象params。
+    // 把参数设置到对象params。用于创建微任务队列的回调函数。把该对象作为参数
     v8::Local<v8::Object> params = v8::Object::New(isolate);
     params->Set(context, v8::String::NewFromUtf8Literal(isolate, "modulePath"), info[0]).FromJust();
     params->Set(context, v8::String::NewFromUtf8Literal(isolate, "callBack"), info[1]).FromJust();
 
-    // 存放再微任务队列中。
+    // 存放在微任务队列中。
     isolate->EnqueueMicrotask(v8::Function::New(context, [](const v8::FunctionCallbackInfo<v8::Value> &info) -> void {
         v8::Isolate* isolate = info.GetIsolate();
         v8::HandleScope handleScope(isolate);
@@ -178,25 +200,30 @@ void async(const v8::FunctionCallbackInfo<v8::Value> &info) {
         v8::Local<v8::Function> requireFun = v8::Function::New(context, require).ToLocalChecked();
         v8::Local<v8::Value> args[] = { params->Get(context, v8::String::NewFromUtf8Literal(isolate, "modulePath")).ToLocalChecked() };
         v8::Local<v8::Value> result = requireFun->Call(context, context->Global(), 1, args).ToLocalChecked();
-        v8::Local<v8::Function> callBack = params->Get(context, v8::String::NewFromUtf8Literal(isolate, "callBack")).ToLocalChecked();
+        v8::Local<v8::Function> callBack = params->Get(context, v8::String::NewFromUtf8Literal(isolate, "callBack")).ToLocalChecked().As<v8::Function>();
 
+        // 执行async 函数的回调
         if (result.IsEmpty() || result->IsUndefined()) {
             v8::Local<v8::Value> argv[] = { v8::Null(isolate) };
-            callBack->Call(context, context->Global(), 1, argv);
+            callBack->Call(context, context->Global(), 1, argv).ToLocalChecked();
         } else {
             v8::Local<v8::Value> argv[] = { result };
-            callBack->Call(context, context->Global(), 1, argv);
+            callBack->Call(context, context->Global(), 1, argv).ToLocalChecked();
         }
     }, params).ToLocalChecked());
 }
 
 /**
- * 全局对象define 的实现
+ * 全局对象define 的实现, 参数 require, export, module由c++负责创建和执行。
+ * 1: define(function(require, export, module) {
+ * })
+ * 2:define(value)
  * @param info
  */
 void define(const v8::FunctionCallbackInfo<v8::Value> &info) {
     v8::Isolate* isolate = info.GetIsolate();
     v8::Local<v8::Context> context = isolate->GetCurrentContext();
+    v8::HandleScope handleScope(isolate);
     // 参数校验，define的参数必须为一个函数或者为一个有效的javaScript值。
     if (!info.Length() || info[0]->IsUndefined() || info[0]->IsNull()) {
         info.GetReturnValue().Set(isolate->ThrowException(v8::String::NewFromUtf8Literal(isolate, "需要一个参数")));
@@ -221,7 +248,7 @@ void define(const v8::FunctionCallbackInfo<v8::Value> &info) {
         v8::Local<v8::Function> moduleCallBack = info[0].As<v8::Function>();
         // 构建require 函数
         v8::Local<v8::Function> requireFun =  v8::Function::New(context, require).ToLocalChecked();
-        // 为require 函数添加 async 函数属性
+        // 为require 函数增加 async 函数属性
         requireFun->Set(context, v8::String::NewFromUtf8Literal(isolate, "async"), v8::Function::New(context, async).ToLocalChecked()).FromJust();
         v8::Local<v8::Value> argv[] = { requireFun, exports, module};
         // 执行define 的参数回调
@@ -262,12 +289,12 @@ int main(int args, char** argv) {
         v8::Isolate::Scope isolate_scope(isolate);
         v8::HandleScope handleScope(isolate);
 
-        // 设置微任务队列策略为 手动
+        // 设置微任务队列策略 显示调用
         isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
         v8::Local<v8::Context> context = v8::Context::New(isolate);
         v8::Context::Scope context_scope(context);
 
-        // 初始化当前模块和 缓存模块
+        // 初始化当前模块ID和缓存模块
         currentModuleId.Reset(isolate, v8::String::NewFromUtf8(isolate, workDirBuffer).ToLocalChecked());
         cache.Reset(isolate, v8::Object::New(isolate));
 
